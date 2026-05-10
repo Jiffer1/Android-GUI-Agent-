@@ -1,0 +1,158 @@
+三模块数据流图（Planner / UIExtractor / ActionAnalyzer）
+
+============================================================
+一、总体数据流（按 step）
+============================================================
+
+                         +----------------------+
+                         |      用户任务指令      |
+                         |      instruction      |
+                         +----------+-----------+
+                                    |
+                                    | step=1
+                                    v
+                         +----------------------+
+                         |       Planner        |
+                         |  输出: app_name,     |
+                         |       subgoals       |
+                         +----+------------+----+
+                              |            |
+                              |            +----------------------+
+                              |                                   |
+                              v                                   v
+                    +------------------+                +------------------+
+                    | OPEN(app_name)   |                | 保存状态 subgoals |
+                    +------------------+                +------------------+
+
+
+step>=2 循环:
+
++-------------------+      +-------------------------+
+| 当前截图 current  |----->|       UIExtractor       |
+| image             |      | 输入: instruction,      |
++-------------------+      |      subgoals, image    |
+                           | 输出: ui_state =        |
+                           |   {elements, page_type} |
+                           +------------+------------+
+                                        |
+                                        v
+                           +-------------------------+
+                           |     ActionAnalyzer      |
+                           | 输入: instruction,      |
+                           | subgoals, ui_state,     |
+                           | previous_progress,      |
+                           | image                   |
+                           | 输出: action, params,   |
+                           |      progress           |
+                           +------------+------------+
+                                        |
+                                        v
+                           +-------------------------+
+                           |     _normalize_schema   |
+                           | 规范动作与参数格式      |
+                           +------------+------------+
+                                        |
+                                        v
+                           +-------------------------+
+                           | AgentOutput(action,     |
+                           | parameters, raw_output, |
+                           | usage)                  |
+                           +------------+------------+
+                                        |
+                                        v
+                           +-------------------------+
+                           | 执行动作并进入下一步截图 |
+                           +------------+------------+
+                                        |
+                                        v
+                           previous_progress = progress
+
+
+============================================================
+二、模块间关键字段流向
+============================================================
+
+Planner
+  输入:
+    - instruction
+  输出:
+    - subgoals (保存到 self.subgoals)
+    - app_name (用于 OPEN)
+
+UIExtractor
+  输入:
+    - instruction
+    - self.subgoals
+    - current_image
+  输出:
+    - ui_state.elements[]
+      每项: {text, type, point, selected, high_risk}
+    - ui_state.page_type
+
+ActionAnalyzer
+  输入:
+    - instruction
+    - self.subgoals
+    - ui_state
+    - self.progress (previous_progress)
+    - current_image
+  输出:
+    - action
+    - parameters
+    - progress (保存回 self.progress)
+
+Normalize
+  输入:
+    - action, parameters
+  输出:
+    - 标准动作协议参数（CLICK/SCROLL/TYPE/OPEN/COMPLETE）
+
+
+============================================================
+三、异常容错数据流（ActionAnalyzer JSON 解析失败）
+============================================================
+
+ActionAnalyzer 原始文本 raw
+        |
+        v
+_try _extract_json_object(raw)
+        |
+        +-- 成功 --> 使用 action/parameters/progress
+        |
+        +-- 失败 --> _extract_action_fallback(raw)
+                      - 正则提取 action
+                      - 括号深度提取 parameters
+                      - 正则提取 progress
+                      -> 再进入 _normalize_schema
+
+
+============================================================
+四、Mermaid 版本（可复制到支持 Mermaid 的工具渲染）
+============================================================
+
+flowchart TD
+    A[instruction] --> B[Planner]
+    B --> C[OPEN app_name]
+    B --> D[self.subgoals]
+
+    E[current_image] --> F[UIExtractor]
+    D --> F
+    A --> F
+    F --> G[ui_state: elements + page_type]
+
+    A --> H[ActionAnalyzer]
+    D --> H
+    G --> H
+    I[self.progress as previous_progress] --> H
+    E --> H
+
+    H --> J[action + parameters + progress]
+    J --> K[_normalize_schema]
+    K --> L[AgentOutput]
+    L --> M[next step image]
+    J --> I
+
+    H --> N{JSON parse ok?}
+    N -- yes --> J
+    N -- no --> O[_extract_action_fallback]
+    O --> J
