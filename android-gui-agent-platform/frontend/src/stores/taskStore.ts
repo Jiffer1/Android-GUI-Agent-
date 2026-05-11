@@ -2,6 +2,19 @@ import { create } from 'zustand'
 import type { Task, TaskStep } from '../api/client'
 import type { WSEvent } from '../api/websocket'
 
+export interface RouteInfo {
+  route: string
+  reason: string
+}
+
+export interface EscalationInfo {
+  step_index: number
+  reason: string
+  signals: string[]
+  from_route: string
+  to_route: string
+}
+
 interface TaskStore {
   tasks: Task[]
   currentTask: Task | null
@@ -9,6 +22,10 @@ interface TaskStore {
   latestScreenshot: string | null
   latestAction: string | null
   latestParameters: Record<string, unknown> | null
+  latestConfidence: number | null
+  latestRoute: string | null
+  routeInfo: RouteInfo | null
+  escalation: EscalationInfo | null
   riskEvent: WSEvent | null
   wsConnected: boolean
 
@@ -20,6 +37,14 @@ interface TaskStore {
   handleWSEvent: (event: WSEvent) => void
 }
 
+function asString(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
+function asNumber(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
 export const useTaskStore = create<TaskStore>((set) => ({
   tasks: [],
   currentTask: null,
@@ -27,11 +52,16 @@ export const useTaskStore = create<TaskStore>((set) => ({
   latestScreenshot: null,
   latestAction: null,
   latestParameters: null,
+  latestConfidence: null,
+  latestRoute: null,
+  routeInfo: null,
+  escalation: null,
   riskEvent: null,
   wsConnected: false,
 
   setTasks: (tasks) => set({ tasks }),
-  setCurrentTask: (task) => set({ currentTask: task }),
+  setCurrentTask: (task) =>
+    set({ currentTask: task, routeInfo: null, escalation: null, latestRoute: null, latestConfidence: null }),
   setSteps: (steps) => set({ steps }),
   setWsConnected: (v) => set({ wsConnected: v }),
   clearRiskEvent: () => set({ riskEvent: null }),
@@ -44,6 +74,25 @@ export const useTaskStore = create<TaskStore>((set) => ({
             currentTask: state.currentTask
               ? { ...state.currentTask, status: 'running' }
               : state.currentTask,
+          }
+        case 'task.routed':
+          return {
+            routeInfo: {
+              route: asString(event.data.route),
+              reason: asString(event.data.reason),
+            },
+            latestRoute: asString(event.data.route),
+          }
+        case 'escalation.triggered':
+          return {
+            escalation: {
+              step_index: (event.data.step_index as number) ?? 0,
+              reason: asString(event.data.reason),
+              signals: Array.isArray(event.data.signals) ? (event.data.signals as string[]) : [],
+              from_route: asString(event.data.from_route),
+              to_route: asString(event.data.to_route),
+            },
+            latestRoute: asString(event.data.to_route) || state.latestRoute,
           }
         case 'step.completed': {
           const d = event.data
@@ -69,6 +118,8 @@ export const useTaskStore = create<TaskStore>((set) => ({
             latestScreenshot: (d.screenshot_base64 as string | undefined) ?? state.latestScreenshot,
             latestAction: d.action as string,
             latestParameters: d.parameters as Record<string, unknown>,
+            latestConfidence: asNumber(d.confidence) ?? state.latestConfidence,
+            latestRoute: asString(d.route) || state.latestRoute,
           }
         }
         case 'task.paused':

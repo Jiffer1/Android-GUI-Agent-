@@ -1,7 +1,7 @@
 import asyncio
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from app.agent.schemas import AgentOutput
+from app.agent.schemas import AgentOutput, ROUTE_STANDARD
 
 
 class TaskSession:
@@ -18,3 +18,7 @@ class TaskSession:
         self.pending_action: Optional[AgentOutput] = None
         self.confirm_event = asyncio.Event()
         self.confirm_approved = False
+
+        self.route: str = ROUTE_STANDARD
+        self.escalated: bool = False
+        self.escalation_reason: str = ""

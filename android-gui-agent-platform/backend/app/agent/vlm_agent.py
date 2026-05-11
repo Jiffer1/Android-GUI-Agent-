@@ -20,6 +20,10 @@ from app.agent.schemas import (
     ACTION_OPEN,
     ACTION_SCROLL,
     ACTION_TYPE,
+    ALL_RISK_CATEGORIES,
+    ALL_RISK_LEVELS,
+    RISK_CATEGORY_NONE,
+    RISK_LEVEL_SAFE,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +75,11 @@ class VlmGuiAgent:
         self._last_progress = self.progress
 
         ui_state = self._extract_ui(input_data)
-        action, params, progress, raw = self._analyze_action(input_data, ui_state)
+        analyzer = self._analyze_action(input_data, ui_state)
+        action = analyzer["action"]
+        params = analyzer["parameters"]
+        progress = analyzer["progress"]
+        raw = analyzer["raw"]
         action, params = self._postprocess_action(input_data, ui_state, action, params, app_name)
         action, params = self._normalize_schema(action, params)
         self.progress = progress
@@ -88,7 +96,28 @@ class VlmGuiAgent:
             if planner_raw
             else raw
         )
-        return AgentOutput(action=action, parameters=params, raw_output=combined_raw)
+
+        ui_risk_elements = [
+            {"text": el.get("text", ""), "point": el.get("point", [])}
+            for el in ui_state.get("elements", [])
+            if el.get("high_risk")
+        ]
+
+        return AgentOutput(
+            action=action,
+            parameters=params,
+            raw_output=combined_raw,
+            risk_level=analyzer["risk_level"],
+            risk_category=analyzer["risk_category"],
+            current_state=analyzer["current_state"],
+            consequence=analyzer["consequence"],
+            rollback_hint=analyzer["rollback_hint"],
+            risk_reason=analyzer["risk_reason"],
+            confidence=analyzer["confidence"],
+            current_subgoal_index=analyzer["current_subgoal_index"],
+            stuck_count=self._stuck_count,
+            ui_risk_elements=ui_risk_elements,
+        )
 
     # ------------------------------------------------------------------
     # API
@@ -243,7 +272,7 @@ class VlmGuiAgent:
     # Module 3 — ActionAnalyzer
     # ------------------------------------------------------------------
 
-    def _analyze_action(self, input_data: AgentInput, ui_state: Dict) -> Tuple[str, Dict, str, str]:
+    def _analyze_action(self, input_data: AgentInput, ui_state: Dict) -> Dict[str, Any]:
         recovery_hint = ""
         if self._stuck_count >= 2:
             recovery_hint = (
@@ -259,7 +288,7 @@ class VlmGuiAgent:
             history_text = f"\nrecent_actions: {json.dumps(recent, ensure_ascii=False)}"
 
         system_prompt = (
-            "你是一个手机 GUI 自动化决策器。\n\n"
+            "你是一个手机 GUI 自动化决策器，同时也是自身决策的风险评估器。\n\n"
             "决策依据：\n"
             "1. 以 instruction 为最终目标，判断任务是否完成\n"
             "2. previous_progress 是上一轮状态摘要，必须作为当前决策的连续上下文优先参考\n"
@@ -276,10 +305,41 @@ class VlmGuiAgent:
             "- high_risk=true 的元素默认禁止点击\n\n"
             "【进度摘要】\n"
             "- 每一步都必须输出 progress，一句中文\n"
-            "- progress 必须包含：已完成内容 + 当前页面状态 + 下一步目标\n"
+            "- progress 必须包含：已完成内容 + 当前页面状态 + 下一步目标\n\n"
+            "【风险评估 —— 必须先评估再决定】\n"
+            "- risk_level 取值：safe / medium / high\n"
+            "  · safe：浏览、滚动、返回、回到桌面、打开应用等可随时撤销的操作\n"
+            "  · medium：进入未知页面、点击 high_risk=true 但用途不明的元素、提交可撤销的表单\n"
+            "  · high：不可逆或有外部影响的动作\n"
+            "- risk_category 取值：payment / delete / auth / submit / communication / system / none\n"
+            "  · payment：支付、确认支付、立即付款、立即购买、转账\n"
+            "  · delete：删除、清空、移除\n"
+            "  · auth：授权、登录、绑定第三方账号\n"
+            "  · submit：发布、提交订单等不可撤销的提交类\n"
+            "  · communication：发送消息、拨打电话、一键呼叫\n"
+            "  · system：卸载、格式化、清除应用数据、root\n"
+            "  · none：risk_level=safe 时填 none\n"
+            "- current_state：一句话描述当前页面与上下文（让人类操作员能快速理解局势）\n"
+            "- consequence：执行该动作后会发生什么（包含金额、对象、影响范围等关键信息）\n"
+            "- rollback_hint：如何撤销；若不可撤销，写\"不可撤销\"\n"
+            "- risk_reason：为何判定为该 risk_level\n"
+            "- confidence：当前决策的置信度，0~1 之间的小数；含义=该动作能推进任务的把握程度\n"
+            "- current_subgoal_index：当前正在执行的 subgoals 下标（0 起），若无法判断填 null\n"
             + recovery_hint
             + "\n输出严格 JSON：\n"
-            "{\"action\":\"...\",\"parameters\":{...},\"progress\":\"...\"}\n"
+            "{\n"
+            "  \"action\":\"...\",\n"
+            "  \"parameters\":{...},\n"
+            "  \"progress\":\"...\",\n"
+            "  \"risk_level\":\"safe|medium|high\",\n"
+            "  \"risk_category\":\"payment|delete|auth|submit|communication|system|none\",\n"
+            "  \"current_state\":\"...\",\n"
+            "  \"consequence\":\"...\",\n"
+            "  \"rollback_hint\":\"...\",\n"
+            "  \"risk_reason\":\"...\",\n"
+            "  \"confidence\":0.0,\n"
+            "  \"current_subgoal_index\":0\n"
+            "}\n"
             "禁止输出额外文字。"
         )
 
@@ -316,15 +376,60 @@ class VlmGuiAgent:
                 action = str(obj.get("action", "")).upper().strip()
                 params = obj.get("parameters", {})
                 progress = obj.get("progress", "")
+                risk_level = obj.get("risk_level", RISK_LEVEL_SAFE)
+                risk_category = obj.get("risk_category", RISK_CATEGORY_NONE)
+                current_state = obj.get("current_state", "")
+                consequence = obj.get("consequence", "")
+                rollback_hint = obj.get("rollback_hint", "")
+                risk_reason = obj.get("risk_reason", "")
+                confidence = obj.get("confidence", 1.0)
+                current_subgoal_index = obj.get("current_subgoal_index", None)
             else:
                 action, params, progress = self._extract_action_fallback(raw)
+                risk_level, risk_category = RISK_LEVEL_SAFE, RISK_CATEGORY_NONE
+                current_state = consequence = rollback_hint = risk_reason = ""
+                confidence = 1.0
+                current_subgoal_index = None
+
             if not isinstance(params, dict):
                 params = {}
             if not isinstance(progress, str):
                 progress = str(progress)
-            return action, params, progress, raw
+
+            risk_level = self._normalize_enum(risk_level, ALL_RISK_LEVELS, RISK_LEVEL_SAFE)
+            risk_category = self._normalize_enum(risk_category, ALL_RISK_CATEGORIES, RISK_CATEGORY_NONE)
+            confidence = self._clamp_confidence(confidence)
+            subgoal_index = self._normalize_subgoal_index(current_subgoal_index)
+
+            return {
+                "action": action,
+                "parameters": params,
+                "progress": progress,
+                "raw": raw,
+                "risk_level": risk_level,
+                "risk_category": risk_category,
+                "current_state": str(current_state or ""),
+                "consequence": str(consequence or ""),
+                "rollback_hint": str(rollback_hint or ""),
+                "risk_reason": str(risk_reason or ""),
+                "confidence": confidence,
+                "current_subgoal_index": subgoal_index,
+            }
         except Exception:
-            return ACTION_COMPLETE, {}, self.progress, ""
+            return {
+                "action": ACTION_COMPLETE,
+                "parameters": {},
+                "progress": self.progress,
+                "raw": "",
+                "risk_level": RISK_LEVEL_SAFE,
+                "risk_category": RISK_CATEGORY_NONE,
+                "current_state": "",
+                "consequence": "",
+                "rollback_hint": "",
+                "risk_reason": "",
+                "confidence": 0.0,
+                "current_subgoal_index": None,
+            }
 
     # ------------------------------------------------------------------
     # Post-processing and normalization
@@ -453,3 +558,29 @@ class VlmGuiAgent:
             max(0, min(1000, int(float(point[0])))),
             max(0, min(1000, int(float(point[1])))),
         ]
+
+    def _normalize_enum(self, value: Any, allowed: List[str], default: str) -> str:
+        v = str(value or "").strip().lower()
+        return v if v in allowed else default
+
+    def _clamp_confidence(self, value: Any) -> float:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if f != f:  # NaN
+            return 1.0
+        return max(0.0, min(1.0, f))
+
+    def _normalize_subgoal_index(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            i = int(value)
+        except (TypeError, ValueError):
+            return None
+        if i < 0:
+            return None
+        if self.subgoals and i >= len(self.subgoals):
+            return len(self.subgoals) - 1
+        return i

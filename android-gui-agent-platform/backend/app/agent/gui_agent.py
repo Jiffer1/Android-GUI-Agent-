@@ -1,19 +1,17 @@
 from app.agent.schemas import (
     AgentInput, AgentOutput,
-    ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN, ACTION_COMPLETE,
+    ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_COMPLETE,
 )
 
 
 class MockGuiAgent:
-    """Scripted mock agent for testing without LLM calls.
+    """Scripted mock agent for testing without LLM calls."""
 
-    Returns deterministic actions based on step_index so the full
-    runtime loop can be exercised without a real device or model.
-    Replace this class with a real VLM-backed agent later.
-    """
+    def __init__(self):
+        self.last_ui_state = None
 
     def reset(self):
-        pass
+        self.last_ui_state = None
 
     def act(self, input_data: AgentInput) -> AgentOutput:
         step = input_data.step_count

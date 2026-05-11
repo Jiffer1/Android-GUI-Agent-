@@ -3,28 +3,38 @@ import base64
 import io
 import json
 import logging
-from typing import Dict, Optional
+import os
+from collections import deque
+from typing import Deque, Dict, Optional
 
 from PIL import Image
 
-from app.agent.vlm_agent import VlmGuiAgent
-from app.agent.schemas import AgentInput, AgentOutput, ACTION_COMPLETE
-from app.config.settings import settings
+from app.agent import escalation as escalation_policy
+from app.agent.gui_agent import MockGuiAgent
+from app.agent.react_agent import ReactGuiAgent
+from app.agent.router import build_agent
+from app.agent.schemas import (
+    AgentInput, AgentOutput, ACTION_COMPLETE,
+    ROUTE_REACT, ROUTE_STANDARD,
+)
 from app.device.base import AdbNotFoundError, DeviceError
 from app.device.registry import get_controller
 from app.runtime.events import (
     WSEvent,
     TASK_STARTED, STEP_STARTED, STEP_COMPLETED,
     TASK_PAUSED, TASK_RESUMED, TASK_FINISHED, TASK_FAILED, TASK_STOPPED, RISK_DETECTED,
+    TASK_ROUTED, ESCALATION_TRIGGERED,
 )
 from app.runtime.session import TaskSession
-from app.safety.policy import check_action
+from app.safety.policy import assess_output
 from app.storage.artifact_store import save_screenshot
 from app.storage.db import SessionLocal
 from app.storage.models import Task, TaskStep
 from app.ws.connection_manager import manager
 
 logger = logging.getLogger(__name__)
+
+USE_MOCK_AGENT = os.environ.get("USE_MOCK_AGENT", "").lower() in {"1", "true", "yes"}
 
 
 def _image_to_base64(image: Image.Image) -> str:
@@ -181,13 +191,20 @@ class RuntimeEngine:
             await self._broadcast(task_id, WSEvent(event=TASK_STARTED, task_id=task_id,
                                                     data={"instruction": task.instruction}))
 
-            agent = VlmGuiAgent()
+            agent, route_decision = build_agent(task.instruction, mock=USE_MOCK_AGENT)
             agent.reset()
+            session.route = route_decision.route
+            await self._broadcast(task_id, WSEvent(event=TASK_ROUTED, task_id=task_id, data={
+                "route": route_decision.route,
+                "reason": route_decision.reason,
+            }))
 
             has_device = bool(task.device_id)
             controller = get_controller(task.device_id) if has_device else None
             history_actions = []
             stable_image: Optional[Image.Image] = None  # pre-fetched stable screenshot
+            recent_pre_action_images: Deque[Image.Image] = deque(maxlen=escalation_policy.SCREEN_STUCK_WINDOW)
+            last_subgoal_index: Optional[int] = None
 
             for step_index in range(task.max_steps):
                 if session.stop_requested:
@@ -215,6 +232,16 @@ class RuntimeEngine:
                 else:
                     image = _make_placeholder_image()
 
+                # Track screen-stuck streak using the snapshot fed to the agent.
+                screen_similar_streak = 0
+                if recent_pre_action_images:
+                    for prev_img in reversed(recent_pre_action_images):
+                        if _images_are_similar(prev_img, image):
+                            screen_similar_streak += 1
+                        else:
+                            break
+                recent_pre_action_images.append(image)
+
                 # Agent decision
                 agent_input = AgentInput(
                     instruction=task.instruction,
@@ -224,8 +251,40 @@ class RuntimeEngine:
                 )
                 output: AgentOutput = await loop.run_in_executor(None, agent.act, agent_input)
 
-                # Safety check
-                safety = check_action(output.action, output.parameters)
+                # EscalationPolicy: if signals fire, swap to ReAct and redo this step.
+                decision = escalation_policy.evaluate(
+                    output,
+                    history_actions=history_actions,
+                    agent_last_ui_state=getattr(agent, "last_ui_state", None),
+                    screen_similar_streak=screen_similar_streak,
+                    last_subgoal_index=last_subgoal_index,
+                    current_route=session.route,
+                )
+                if decision.should_escalate and not session.escalated:
+                    session.escalated = True
+                    session.escalation_reason = decision.reason
+                    session.route = ROUTE_REACT
+                    await self._broadcast(task_id, WSEvent(event=ESCALATION_TRIGGERED, task_id=task_id, data={
+                        "step_index": step_index,
+                        "reason": decision.reason,
+                        "signals": decision.signals,
+                        "from_route": route_decision.route,
+                        "to_route": ROUTE_REACT,
+                    }))
+                    new_agent = ReactGuiAgent()
+                    new_agent.reset()
+                    new_agent.adopt({
+                        "last_ui_state": getattr(agent, "last_ui_state", None),
+                        "stuck_count": output.stuck_count,
+                    })
+                    agent = new_agent
+                    output = await loop.run_in_executor(None, agent.act, agent_input)
+
+                if output.current_subgoal_index is not None:
+                    last_subgoal_index = output.current_subgoal_index
+
+                # Safety assessment: read model-provided risk fields, no keywords.
+                safety = assess_output(output)
 
                 if not safety.is_safe:
                     session.pause_event.clear()
@@ -239,7 +298,12 @@ class RuntimeEngine:
                         "action": output.action,
                         "parameters": output.parameters,
                         "risk_level": safety.risk_level,
+                        "risk_category": safety.risk_category,
+                        "current_state": safety.current_state,
+                        "consequence": safety.consequence,
+                        "rollback_hint": safety.rollback_hint,
                         "reason": safety.reason,
+                        "ui_risk_elements": safety.ui_risk_elements,
                     }))
                     await session.confirm_event.wait()
                     session.waiting_for_confirm = False
@@ -278,6 +342,14 @@ class RuntimeEngine:
                     "parameters": output.parameters,
                     "raw_output": output.raw_output,
                     "risk_level": safety.risk_level,
+                    "risk_category": safety.risk_category,
+                    "current_state": safety.current_state,
+                    "consequence": safety.consequence,
+                    "rollback_hint": safety.rollback_hint,
+                    "confidence": output.confidence,
+                    "current_subgoal_index": output.current_subgoal_index,
+                    "stuck_count": output.stuck_count,
+                    "route": session.route,
                     "screenshot_base64": screenshot_b64,
                     "screenshot_path": screenshot_path,
                 }))

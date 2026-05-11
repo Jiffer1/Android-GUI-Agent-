@@ -12,6 +12,8 @@ TASK_FINISHED = "task.finished"
 TASK_FAILED = "task.failed"
 TASK_STOPPED = "task.stopped"
 RISK_DETECTED = "risk.detected"
+TASK_ROUTED = "task.routed"
+ESCALATION_TRIGGERED = "escalation.triggered"
 
 
 class WSEvent(BaseModel):

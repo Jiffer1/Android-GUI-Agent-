@@ -23,6 +23,7 @@ export default function TaskDetail() {
 
   const {
     currentTask, steps, latestScreenshot, latestAction, latestParameters,
+    latestConfidence, latestRoute, routeInfo, escalation,
     riskEvent, setCurrentTask, setSteps, handleWSEvent, clearRiskEvent,
   } = useTaskStore()
 
@@ -66,7 +67,14 @@ export default function TaskDetail() {
           <div className="text-sm text-gray-200 truncate">{currentTask?.instruction ?? '…'}</div>
           <div className="text-xs text-gray-500 font-mono">
             {id?.slice(0, 8)} · {currentTask?.device_id ?? 'mock'} · step {currentTask?.current_step ?? 0}/{currentTask?.max_steps ?? 20}
+            {latestRoute && <span className="ml-2 text-cyan-700">[{latestRoute}]</span>}
+            {latestConfidence !== null && <span className="ml-2 text-gray-600">conf {(latestConfidence * 100).toFixed(0)}%</span>}
           </div>
+          {escalation && (
+            <div className="text-xs text-yellow-500 mt-0.5">
+              ⬆ 升级到 ReAct @ step {escalation.step_index}：{escalation.reason}
+            </div>
+          )}
         </div>
         <span className={`text-sm font-medium ${STATUS_COLORS[status] ?? 'text-gray-400'}`}>{status}</span>
       </div>
