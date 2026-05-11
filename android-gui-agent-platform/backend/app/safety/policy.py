@@ -43,7 +43,7 @@ def assess_output(output: AgentOutput, ui_risk_elements: Optional[List[Dict[str,
 
     elements = ui_risk_elements if ui_risk_elements is not None else list(output.ui_risk_elements or [])
 
-    is_safe = level == RISK_LEVEL_SAFE
+    is_safe = level != RISK_LEVEL_HIGH
 
     return SafetyResult(
         is_safe=is_safe,

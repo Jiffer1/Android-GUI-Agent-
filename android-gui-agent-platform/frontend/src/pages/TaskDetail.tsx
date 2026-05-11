@@ -24,7 +24,7 @@ export default function TaskDetail() {
   const {
     currentTask, steps, latestScreenshot, latestAction, latestParameters,
     latestConfidence, latestRoute, routeInfo, escalation,
-    riskEvent, setCurrentTask, setSteps, handleWSEvent, clearRiskEvent,
+    riskEvent, riskObservedEvents, setCurrentTask, setSteps, handleWSEvent, clearRiskEvent,
   } = useTaskStore()
 
   useEffect(() => {
@@ -149,14 +149,34 @@ export default function TaskDetail() {
             </div>
             <div className="flex-1 overflow-y-auto p-2 space-y-1">
               {steps.map((s) => (
-                <div key={s.step_index} className="text-xs font-mono text-gray-500">
+                <div key={s.step_index} className={`text-xs font-mono ${s.risk_level === 'medium' ? 'text-yellow-600' : 'text-gray-500'}`}>
                   <span className="text-gray-600">[{s.step_index}]</span>{' '}
-                  <span className="text-cyan-600">{s.action}</span>{' '}
+                  <span className={s.risk_level === 'medium' ? 'text-yellow-500' : 'text-cyan-600'}>{s.action}</span>{' '}
+                  {s.risk_level === 'medium' && <span className="text-yellow-700">⚠ </span>}
                   <span>{s.raw_output ?? ''}</span>
                 </div>
               ))}
             </div>
           </div>
+
+          {/* Medium risk observations */}
+          {riskObservedEvents.length > 0 && (
+            <div className="bg-yellow-950 rounded border border-yellow-800 overflow-hidden flex flex-col max-h-40">
+              <div className="px-3 py-1.5 text-xs text-yellow-600 border-b border-yellow-800 font-semibold uppercase tracking-wider">
+                ⚠ 风险观察 ({riskObservedEvents.length})
+              </div>
+              <div className="overflow-y-auto p-2 space-y-1">
+                {riskObservedEvents.map((obs, i) => (
+                  <div key={i} className="text-xs text-yellow-700">
+                    <span className="text-yellow-600">[{obs.step_index}]</span>{' '}
+                    <span className="text-yellow-500">{obs.action}</span>{' '}
+                    {obs.risk_category !== 'none' && <span className="text-yellow-600">{obs.risk_category} · </span>}
+                    <span>{obs.current_state || obs.consequence}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

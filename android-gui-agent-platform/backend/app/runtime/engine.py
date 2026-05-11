@@ -22,7 +22,8 @@ from app.device.registry import get_controller
 from app.runtime.events import (
     WSEvent,
     TASK_STARTED, STEP_STARTED, STEP_COMPLETED,
-    TASK_PAUSED, TASK_RESUMED, TASK_FINISHED, TASK_FAILED, TASK_STOPPED, RISK_DETECTED,
+    TASK_PAUSED, TASK_RESUMED, TASK_FINISHED, TASK_FAILED, TASK_STOPPED,
+    RISK_DETECTED, RISK_OBSERVED,
     TASK_ROUTED, ESCALATION_TRIGGERED,
 )
 from app.runtime.session import TaskSession
@@ -35,6 +36,20 @@ from app.ws.connection_manager import manager
 logger = logging.getLogger(__name__)
 
 USE_MOCK_AGENT = os.environ.get("USE_MOCK_AGENT", "").lower() in {"1", "true", "yes"}
+
+# Per-action max wait seconds for screen stabilization.
+# OPEN/BACK/HOME can trigger long loads; CLICK may open new pages too.
+_STABLE_MAX: Dict[str, float] = {
+    "OPEN": 20.0,
+    "CLICK": 10.0,
+    "SCROLL": 6.0,
+    "TYPE": 3.0,
+    "BACK": 8.0,
+    "HOME": 8.0,
+}
+_STABLE_HARD_CAP: float = float(os.environ.get("WAIT_STABLE_MAX_SECONDS", "25"))
+_STABLE_CONSECUTIVE: int = 2   # require N consecutive similar frames before declaring stable
+_STABLE_EARLY_THRESHOLD: float = 0.005  # diff below this = fully static, exit early
 
 
 def _image_to_base64(image: Image.Image) -> str:
@@ -104,22 +119,43 @@ class RuntimeEngine:
     # ------------------------------------------------------------------
 
     async def _wait_for_stable_screen(self, controller, loop, action: str) -> Image.Image:
-        """Take screenshots until two consecutive frames are similar (page has settled)."""
+        """Poll screenshots until the screen has stabilized after an action.
+
+        Stability criteria:
+        - _STABLE_CONSECUTIVE consecutive frame-pairs are all similar (threshold 0.02)
+        - OR _STABLE_CONSECUTIVE consecutive frame-pairs are all fully static (threshold 0.005)
+        Hard cap: _STABLE_HARD_CAP seconds total.
+        """
         min_waits = {"OPEN": 2.5, "CLICK": 0.6, "SCROLL": 0.4, "TYPE": 0.15,
                      "BACK": 0.6, "HOME": 0.8}
         await asyncio.sleep(min_waits.get(action, 0.6))
 
-        max_extra = 4.0
+        max_extra = min(_STABLE_MAX.get(action, 10.0), _STABLE_HARD_CAP)
         poll = 0.35
         elapsed = 0.0
+        consecutive_similar = 0
+        consecutive_static = 0
         prev = await loop.run_in_executor(None, controller.screenshot)
+
         while elapsed < max_extra:
             await asyncio.sleep(poll)
             elapsed += poll
             curr = await loop.run_in_executor(None, controller.screenshot)
-            if _images_are_similar(prev, curr):
+
+            if _images_are_similar(prev, curr, threshold=_STABLE_EARLY_THRESHOLD):
+                consecutive_static += 1
+                consecutive_similar += 1
+            elif _images_are_similar(prev, curr):
+                consecutive_static = 0
+                consecutive_similar += 1
+            else:
+                consecutive_static = 0
+                consecutive_similar = 0
+
+            if consecutive_static >= _STABLE_CONSECUTIVE or consecutive_similar >= _STABLE_CONSECUTIVE:
                 return curr
             prev = curr
+
         return prev
 
     def _get_session(self, task_id: str) -> TaskSession:
@@ -286,6 +322,20 @@ class RuntimeEngine:
                 # Safety assessment: read model-provided risk fields, no keywords.
                 safety = assess_output(output)
 
+                # medium risk: broadcast non-blocking observation, do not pause.
+                if safety.risk_level == "medium":
+                    await self._broadcast(task_id, WSEvent(event=RISK_OBSERVED, task_id=task_id, data={
+                        "step_index": step_index,
+                        "action": output.action,
+                        "parameters": output.parameters,
+                        "risk_level": safety.risk_level,
+                        "risk_category": safety.risk_category,
+                        "current_state": safety.current_state,
+                        "consequence": safety.consequence,
+                        "reason": safety.reason,
+                    }))
+
+                # high risk: pause and wait for human confirmation.
                 if not safety.is_safe:
                     session.pause_event.clear()
                     session.waiting_for_confirm = True
@@ -312,8 +362,16 @@ class RuntimeEngine:
                     await loop.run_in_executor(None, self._update_task_status, db, task_id, "running")
                     session.pause_event.set()
 
+                # Skip execution if agent flagged the action as non-executable.
+                action_executed = output.executable
+                if not output.executable:
+                    logger.info(
+                        "Step %d skipped (skip_reason=%s action=%s)",
+                        step_index, output.skip_reason, output.action,
+                    )
+
                 # Execute action, then wait for screen to stabilize
-                if controller:
+                if action_executed and controller:
                     try:
                         await loop.run_in_executor(None, self._execute_action, controller, output)
                         if output.action != ACTION_COMPLETE:
@@ -334,7 +392,9 @@ class RuntimeEngine:
                 )
 
                 screenshot_b64 = _image_to_base64(image)
-                history_actions.append({"action": output.action, "parameters": output.parameters})
+                # Only add to history if the action was actually executed.
+                if action_executed:
+                    history_actions.append({"action": output.action, "parameters": output.parameters})
 
                 await self._broadcast(task_id, WSEvent(event=STEP_COMPLETED, task_id=task_id, data={
                     "step_index": step_index,

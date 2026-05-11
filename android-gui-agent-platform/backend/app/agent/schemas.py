@@ -65,3 +65,5 @@ class AgentOutput:
     current_subgoal_index: Optional[int] = None
     stuck_count: int = 0
     ui_risk_elements: List[Dict[str, Any]] = field(default_factory=list)
+    executable: bool = True
+    skip_reason: str = ""

@@ -93,7 +93,11 @@ class ReactGuiAgent:
             "- 若 prior_thoughts 中已经指出无法找到目标，考虑 BACK 或 HOME 重新进入\n"
             "- 若画面长期未变，尝试 SCROLL 寻找隐藏元素\n\n"
             "【风险评估】\n"
-            "- risk_level / risk_category / current_state / consequence / rollback_hint / risk_reason 必填\n"
+            "- risk_level：safe / medium / high\n"
+            "  · safe：浏览、滚动、返回、回到桌面、打开应用本体、输入搜索关键词、点击普通列表项\n"
+            "  · medium：仅限进入收费/实名/授权页面之前的可返回入口动作（弹窗尚未出现，仍可 BACK 撤销）\n"
+            "  · high：不可逆或有外部影响的动作：确认支付/转账、删除/清空数据、发送消息/拨号、提交不可撤销表单、授权第三方账号、卸载/清除应用数据\n"
+            "- risk_category / current_state / consequence / rollback_hint / risk_reason 必填\n"
             "- confidence：综合候选比较得出的把握程度\n\n"
             "输出严格 JSON：\n"
             "{\n"
@@ -161,7 +165,7 @@ class ReactGuiAgent:
         if thought:
             self._thought_history.append(thought)
 
-        action, params = self._normalize_schema(action, params)
+        action, params, skip_reason = self._normalize_schema(action, params)
 
         signature = json.dumps({"a": action, "p": params}, ensure_ascii=False, sort_keys=True)
         if signature == self._last_action_signature and action != ACTION_COMPLETE:
@@ -180,10 +184,12 @@ class ReactGuiAgent:
             consequence=consequence,
             rollback_hint=rollback_hint,
             risk_reason=risk_reason,
-            confidence=confidence,
+            confidence=0.0 if skip_reason else confidence,
             current_subgoal_index=None,
             stuck_count=self._stuck_count,
             ui_risk_elements=[],
+            executable=not skip_reason,
+            skip_reason=skip_reason,
         )
 
     # ------------------------------------------------------------------
@@ -255,7 +261,7 @@ class ReactGuiAgent:
             max(0, min(1000, int(float(point[1])))),
         ]
 
-    def _normalize_schema(self, action: str, params: Dict) -> Tuple[str, Dict]:
+    def _normalize_schema(self, action: str, params: Dict) -> Tuple[str, Dict, str]:
         action = (action or "").upper().strip()
         alias_map = {"OPEN_APP": ACTION_OPEN, "APP_OPEN": ACTION_OPEN}
         action = alias_map.get(action, action)
@@ -263,13 +269,13 @@ class ReactGuiAgent:
         valid = {ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN,
                  ACTION_COMPLETE, ACTION_BACK, ACTION_HOME}
         if action not in valid:
-            return ACTION_COMPLETE, {}
+            return ACTION_COMPLETE, {}, ""
 
         if action == ACTION_CLICK:
             point = params.get("point")
             if not self._is_point(point):
-                point = [500, 500]
-            return ACTION_CLICK, {"point": self._clamp_point(point)}
+                return ACTION_CLICK, {}, "missing_point"
+            return ACTION_CLICK, {"point": self._clamp_point(point)}, ""
 
         if action == ACTION_SCROLL:
             start = params.get("start_point")
@@ -279,14 +285,22 @@ class ReactGuiAgent:
             return ACTION_SCROLL, {
                 "start_point": self._clamp_point(start),
                 "end_point": self._clamp_point(end),
-            }
+            }, ""
 
         if action == ACTION_TYPE:
             text = params.get("text", "")
-            return ACTION_TYPE, {"text": text if isinstance(text, str) else str(text)}
+            if not isinstance(text, str):
+                text = str(text)
+            if not text:
+                return ACTION_TYPE, {"text": ""}, "missing_text"
+            return ACTION_TYPE, {"text": text}, ""
 
         if action == ACTION_OPEN:
             app_name = params.get("app_name", "")
-            return ACTION_OPEN, {"app_name": app_name if isinstance(app_name, str) else str(app_name)}
+            if not isinstance(app_name, str):
+                app_name = str(app_name)
+            if not app_name.strip():
+                return ACTION_OPEN, {"app_name": ""}, "missing_app_name"
+            return ACTION_OPEN, {"app_name": app_name}, ""
 
-        return action, {}
+        return action, {}, ""

@@ -12,6 +12,7 @@ TASK_FINISHED = "task.finished"
 TASK_FAILED = "task.failed"
 TASK_STOPPED = "task.stopped"
 RISK_DETECTED = "risk.detected"
+RISK_OBSERVED = "risk.observed"
 TASK_ROUTED = "task.routed"
 ESCALATION_TRIGGERED = "escalation.triggered"
 

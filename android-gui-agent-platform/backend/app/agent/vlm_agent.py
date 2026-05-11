@@ -81,7 +81,11 @@ class VlmGuiAgent:
         progress = analyzer["progress"]
         raw = analyzer["raw"]
         action, params = self._postprocess_action(input_data, ui_state, action, params, app_name)
-        action, params = self._normalize_schema(action, params)
+        action, params, skip_reason = self._normalize_schema(action, params)
+        if not skip_reason and action == ACTION_CLICK:
+            point = params.get("point")
+            if not self._click_point_matches_ui(point, ui_state):
+                skip_reason = "click_off_ui"
         self.progress = progress
         self.last_ui_state = ui_state
 
@@ -113,10 +117,12 @@ class VlmGuiAgent:
             consequence=analyzer["consequence"],
             rollback_hint=analyzer["rollback_hint"],
             risk_reason=analyzer["risk_reason"],
-            confidence=analyzer["confidence"],
+            confidence=0.0 if skip_reason else analyzer["confidence"],
             current_subgoal_index=analyzer["current_subgoal_index"],
             stuck_count=self._stuck_count,
             ui_risk_elements=ui_risk_elements,
+            executable=not skip_reason,
+            skip_reason=skip_reason,
         )
 
     # ------------------------------------------------------------------
@@ -308,9 +314,9 @@ class VlmGuiAgent:
             "- progress 必须包含：已完成内容 + 当前页面状态 + 下一步目标\n\n"
             "【风险评估 —— 必须先评估再决定】\n"
             "- risk_level 取值：safe / medium / high\n"
-            "  · safe：浏览、滚动、返回、回到桌面、打开应用等可随时撤销的操作\n"
-            "  · medium：进入未知页面、点击 high_risk=true 但用途不明的元素、提交可撤销的表单\n"
-            "  · high：不可逆或有外部影响的动作\n"
+            "  · safe：浏览、滚动、返回、回到桌面、打开应用本体、输入搜索关键词、点击普通列表项\n"
+            "  · medium：仅限进入收费/实名/授权页面之前的可返回入口动作（例如点开\"立即付款\"弹窗外的入口按钮，但弹窗尚未出现）；此类动作仍可 BACK 撤销\n"
+            "  · high：不可逆或有外部影响的动作，包括：确认支付/转账、删除/清空数据、发送消息/拨号、提交不可撤销表单、授权第三方账号、卸载/清除应用数据\n"
             "- risk_category 取值：payment / delete / auth / submit / communication / system / none\n"
             "  · payment：支付、确认支付、立即付款、立即购买、转账\n"
             "  · delete：删除、清空、移除\n"
@@ -318,7 +324,7 @@ class VlmGuiAgent:
             "  · submit：发布、提交订单等不可撤销的提交类\n"
             "  · communication：发送消息、拨打电话、一键呼叫\n"
             "  · system：卸载、格式化、清除应用数据、root\n"
-            "  · none：risk_level=safe 时填 none\n"
+            "  · none：risk_level=safe 或 medium 且无明确类别时填 none\n"
             "- current_state：一句话描述当前页面与上下文（让人类操作员能快速理解局势）\n"
             "- consequence：执行该动作后会发生什么（包含金额、对象、影响范围等关键信息）\n"
             "- rollback_hint：如何撤销；若不可撤销，写\"不可撤销\"\n"
@@ -453,7 +459,7 @@ class VlmGuiAgent:
 
         return normalized, params if isinstance(params, dict) else {}
 
-    def _normalize_schema(self, action: str, params: Dict) -> Tuple[str, Dict]:
+    def _normalize_schema(self, action: str, params: Dict) -> Tuple[str, Dict, str]:
         action = (action or "").upper().strip()
         alias_map = {"OPEN_APP": ACTION_OPEN, "APP_OPEN": ACTION_OPEN}
         action = alias_map.get(action, action)
@@ -461,13 +467,13 @@ class VlmGuiAgent:
         valid = {ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN,
                  ACTION_COMPLETE, ACTION_BACK, ACTION_HOME}
         if action not in valid:
-            return ACTION_COMPLETE, {}
+            return ACTION_COMPLETE, {}, ""
 
         if action == ACTION_CLICK:
             point = params.get("point")
             if not self._is_point(point):
-                point = [500, 500]
-            return ACTION_CLICK, {"point": self._clamp_point(point)}
+                return ACTION_CLICK, {}, "missing_point"
+            return ACTION_CLICK, {"point": self._clamp_point(point)}, ""
 
         if action == ACTION_SCROLL:
             start = params.get("start_point")
@@ -477,17 +483,25 @@ class VlmGuiAgent:
             return ACTION_SCROLL, {
                 "start_point": self._clamp_point(start),
                 "end_point": self._clamp_point(end),
-            }
+            }, ""
 
         if action == ACTION_TYPE:
             text = params.get("text", "")
-            return ACTION_TYPE, {"text": text if isinstance(text, str) else str(text)}
+            if not isinstance(text, str):
+                text = str(text)
+            if not text:
+                return ACTION_TYPE, {"text": ""}, "missing_text"
+            return ACTION_TYPE, {"text": text}, ""
 
         if action == ACTION_OPEN:
             app_name = params.get("app_name", "")
-            return ACTION_OPEN, {"app_name": app_name if isinstance(app_name, str) else str(app_name)}
+            if not isinstance(app_name, str):
+                app_name = str(app_name)
+            if not app_name.strip():
+                return ACTION_OPEN, {"app_name": ""}, "missing_app_name"
+            return ACTION_OPEN, {"app_name": app_name}, ""
 
-        return action, {}
+        return action, {}, ""
 
     # ------------------------------------------------------------------
     # Helpers
@@ -558,6 +572,21 @@ class VlmGuiAgent:
             max(0, min(1000, int(float(point[0])))),
             max(0, min(1000, int(float(point[1])))),
         ]
+
+    def _click_point_matches_ui(self, point: Any, ui_state: Dict, tolerance: int = 30) -> bool:
+        if not self._is_point(point):
+            return False
+        elements = ui_state.get("elements") or []
+        if not elements:
+            return True  # nothing to validate against
+        px, py = point[0], point[1]
+        for el in elements:
+            ep = el.get("point")
+            if not self._is_point(ep):
+                continue
+            if abs(px - ep[0]) <= tolerance and abs(py - ep[1]) <= tolerance:
+                return True
+        return False
 
     def _normalize_enum(self, value: Any, allowed: List[str], default: str) -> str:
         v = str(value or "").strip().lower()

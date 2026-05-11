@@ -15,6 +15,18 @@ export interface EscalationInfo {
   to_route: string
 }
 
+export interface RiskObservedEvent {
+  step_index: number
+  action: string
+  parameters: Record<string, unknown>
+  risk_level: string
+  risk_category: string
+  current_state: string
+  consequence: string
+  reason: string
+  timestamp: string
+}
+
 interface TaskStore {
   tasks: Task[]
   currentTask: Task | null
@@ -27,6 +39,7 @@ interface TaskStore {
   routeInfo: RouteInfo | null
   escalation: EscalationInfo | null
   riskEvent: WSEvent | null
+  riskObservedEvents: RiskObservedEvent[]
   wsConnected: boolean
 
   setTasks: (tasks: Task[]) => void
@@ -34,6 +47,7 @@ interface TaskStore {
   setSteps: (steps: TaskStep[]) => void
   setWsConnected: (v: boolean) => void
   clearRiskEvent: () => void
+  clearRiskObservedEvents: () => void
   handleWSEvent: (event: WSEvent) => void
 }
 
@@ -57,14 +71,16 @@ export const useTaskStore = create<TaskStore>((set) => ({
   routeInfo: null,
   escalation: null,
   riskEvent: null,
+  riskObservedEvents: [],
   wsConnected: false,
 
   setTasks: (tasks) => set({ tasks }),
   setCurrentTask: (task) =>
-    set({ currentTask: task, routeInfo: null, escalation: null, latestRoute: null, latestConfidence: null }),
+    set({ currentTask: task, routeInfo: null, escalation: null, latestRoute: null, latestConfidence: null, riskObservedEvents: [] }),
   setSteps: (steps) => set({ steps }),
   setWsConnected: (v) => set({ wsConnected: v }),
   clearRiskEvent: () => set({ riskEvent: null }),
+  clearRiskObservedEvents: () => set({ riskObservedEvents: [] }),
 
   handleWSEvent: (event) =>
     set((state) => {
@@ -148,6 +164,21 @@ export const useTaskStore = create<TaskStore>((set) => ({
           }
         case 'risk.detected':
           return { riskEvent: event }
+        case 'risk.observed': {
+          const d = event.data
+          const obs: RiskObservedEvent = {
+            step_index: (d.step_index as number) ?? 0,
+            action: asString(d.action),
+            parameters: (d.parameters as Record<string, unknown>) ?? {},
+            risk_level: asString(d.risk_level),
+            risk_category: asString(d.risk_category),
+            current_state: asString(d.current_state),
+            consequence: asString(d.consequence),
+            reason: asString(d.reason),
+            timestamp: event.timestamp,
+          }
+          return { riskObservedEvents: [...state.riskObservedEvents, obs] }
+        }
         default:
           return {}
       }
