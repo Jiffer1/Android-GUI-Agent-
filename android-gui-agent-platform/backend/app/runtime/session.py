@@ -1,24 +1,33 @@
 import asyncio
 from typing import Optional
 
-from app.agent.schemas import AgentOutput, ROUTE_STANDARD
+from app.agent.schemas import AgentOutput
 
 
-class TaskSession:
-    def __init__(self, task_id: str):
-        self.task_id = task_id
+class ConversationSession:
+    """In-memory runtime state for the active turn of one conversation.
+
+    All waits (ask / confirm) are asyncio.Events; stop_turn sets every one of
+    them so a waiting coroutine can never hang.
+    """
+
+    def __init__(self, conversation_id: str):
+        self.conversation_id = conversation_id
         self.status = "pending"
 
-        # pause_event: set = running, clear = paused
-        self.pause_event = asyncio.Event()
-        self.pause_event.set()
-
         self.stop_requested = False
-        self.waiting_for_confirm = False
+
+        self.waiting_ask = False
+        self.ask_event = asyncio.Event()
+        self.ask_reply = ""
+
+        self.waiting_confirm = False
         self.pending_action: Optional[AgentOutput] = None
         self.confirm_event = asyncio.Event()
         self.confirm_approved = False
 
-        self.route: str = ROUTE_STANDARD
-        self.escalated: bool = False
-        self.escalation_reason: str = ""
+        # Turn bookkeeping (set by the engine when the turn starts)
+        self.turn_id: Optional[str] = ""
+        self.device_id: Optional[str] = None
+        self.turn_task: Optional[object] = None  # concurrent.futures.Future
+        self.turn_loop: Optional[asyncio.AbstractEventLoop] = None

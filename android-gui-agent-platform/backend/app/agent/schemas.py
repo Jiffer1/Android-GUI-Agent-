@@ -9,8 +9,12 @@ ACTION_OPEN = "OPEN"
 ACTION_COMPLETE = "COMPLETE"
 ACTION_BACK = "BACK"
 ACTION_HOME = "HOME"
+ACTION_ASK = "ASK"
 
-ALL_ACTIONS = [ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN, ACTION_COMPLETE, ACTION_BACK, ACTION_HOME]
+ALL_ACTIONS = [
+    ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN,
+    ACTION_COMPLETE, ACTION_BACK, ACTION_HOME, ACTION_ASK,
+]
 
 RISK_LEVEL_SAFE = "safe"
 RISK_LEVEL_MEDIUM = "medium"
@@ -34,11 +38,6 @@ ALL_RISK_CATEGORIES = [
     RISK_CATEGORY_SYSTEM,
 ]
 
-ROUTE_SIMPLE = "simple"
-ROUTE_STANDARD = "standard"
-ROUTE_REACT = "react"
-ALL_ROUTES = [ROUTE_SIMPLE, ROUTE_STANDARD, ROUTE_REACT]
-
 
 @dataclass
 class AgentInput:
@@ -48,6 +47,11 @@ class AgentInput:
     history_messages: List[Dict[str, Any]] = field(default_factory=list)
     history_actions: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
+    # Conversation mode: recent chat messages ([{"role","kind","content"}]),
+    # injected long-term memory text, and the reply to the last ASK (if any).
+    conversation_context: List[Dict[str, Any]] = field(default_factory=list)
+    memory_text: str = ""
+    ask_reply: str = ""
 
 
 @dataclass

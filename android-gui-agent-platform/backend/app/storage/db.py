@@ -18,6 +18,23 @@ class Base(DeclarativeBase):
     pass
 
 
+def init_db() -> None:
+    """Drop legacy task tables and create the conversation schema.
+
+    Idempotent: safe to call on every startup. Legacy tables (tasks /
+    task_steps) are not migrated — their data is intentionally discarded.
+    """
+    from sqlalchemy import text
+
+    import app.storage.models  # noqa: F401  (register mappers before create_all)
+
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS tasks"))
+        conn.execute(text("DROP TABLE IF EXISTS task_steps"))
+        conn.commit()
+    Base.metadata.create_all(bind=engine)
+
+
 def get_db():
     db = SessionLocal()
     try:

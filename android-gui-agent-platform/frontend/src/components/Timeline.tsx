@@ -1,4 +1,4 @@
-import type { TaskStep } from '../api/client'
+import type { TurnStep } from '../api/client'
 
 const ACTION_COLORS: Record<string, string> = {
   CLICK: 'bg-blue-900 text-blue-300',
@@ -18,11 +18,12 @@ const STATUS_ICONS: Record<string, string> = {
 }
 
 interface Props {
-  steps: TaskStep[]
+  steps: TurnStep[]
   activeStep?: number
+  onStepClick?: (stepIndex: number) => void
 }
 
-export default function Timeline({ steps, activeStep }: Props) {
+export default function Timeline({ steps, activeStep, onStepClick }: Props) {
   return (
     <div className="flex flex-col h-full bg-gray-900 rounded border border-gray-800">
       <div className="px-3 py-2 text-xs text-gray-500 border-b border-gray-800 font-semibold uppercase tracking-wider">
@@ -36,9 +37,10 @@ export default function Timeline({ steps, activeStep }: Props) {
             {steps.map((step) => (
               <div
                 key={step.step_index}
+                onClick={() => onStepClick?.(step.step_index)}
                 className={`px-3 py-2 flex items-start gap-2 text-xs ${
-                  activeStep === step.step_index ? 'bg-gray-800' : ''
-                }`}
+                  onStepClick ? 'cursor-pointer hover:bg-gray-800/60' : ''
+                } ${activeStep === step.step_index ? 'bg-gray-800' : ''}`}
               >
                 <span className="text-gray-500 w-5 shrink-0 text-right">{step.step_index}</span>
                 <span

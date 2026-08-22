@@ -1,3 +1,15 @@
+"""ChatGuiAgent: conversation-mode GUI agent (evolved from VlmGuiAgent).
+
+Keeps the three-stage skeleton (Planner -> UIExtractor -> ActionAnalyzer)
+plus the JSON tolerance, coordinate normalization and risk self-assessment
+of the original implementation, and adds:
+
+- conversation_context / memory_text injection into the Planner and Analyzer
+- ask_reply injection (the user's answer to the agent's last ASK)
+- ACTION_ASK output when information is missing or progress has stalled
+- summarize_turn(): the natural-language reply posted to the chat at turn end
+- module-level call_vlm() for text-only VLM calls (memory extractor, …)
+"""
 import base64
 import io
 import json
@@ -13,6 +25,7 @@ from PIL import Image
 from app.agent.schemas import (
     AgentInput,
     AgentOutput,
+    ACTION_ASK,
     ACTION_BACK,
     ACTION_CLICK,
     ACTION_COMPLETE,
@@ -30,14 +43,53 @@ logger = logging.getLogger(__name__)
 
 _EMPTY_UI_STATE: Dict = {"elements": [], "page_type": "unknown"}
 
+# After this many no-progress steps the agent stops guessing and asks the user.
+ASK_ON_STUCK_STEPS = 3
 
-class VlmGuiAgent:
-    """Three-stage VLM-based GUI agent: Planner -> UIExtractor -> ActionAnalyzer."""
+
+def _get_vlm_client() -> OpenAI:
+    api_key = os.environ.get("VLM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("VLM_API_KEY environment variable is not set")
+    return OpenAI(
+        base_url=os.environ.get("VLM_API_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+        api_key=api_key,
+    )
+
+
+def call_vlm(system_prompt: str, user_prompt: str) -> str:
+    """Single text-only VLM call, no retry. Raises on failure."""
+    client = _get_vlm_client()
+    resp = client.chat.completions.create(
+        model=os.environ.get("VLM_MODEL_ID", "doubao-seed-1-6-vision-250815"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    try:
+        return resp.choices[0].message.content or ""
+    except Exception:
+        return ""
+
+
+def _format_context(context: List[Dict[str, Any]]) -> str:
+    if not context:
+        return "（无）"
+    lines = []
+    for m in context:
+        role = m.get("role", "?")
+        kind = m.get("kind", "text")
+        content = str(m.get("content", ""))
+        lines.append(f"[{role}/{kind}] {content}")
+    return "\n".join(lines)
+
+
+class ChatGuiAgent:
+    """Conversation-mode agent: Planner -> UIExtractor -> ActionAnalyzer."""
 
     def __init__(self):
-        self._api_url = os.environ.get("VLM_API_URL", "https://ark.cn-beijing.volces.com/api/v3")
-        self._model_id = os.environ.get("VLM_MODEL_ID", "doubao-seed-1-6-vision-250815")
-        self._api_key = os.environ.get("VLM_API_KEY", "")
         self._client: Optional[OpenAI] = None
         self.subgoals: List[str] = []
         self.last_ui_state: Optional[Dict] = None
@@ -47,9 +99,7 @@ class VlmGuiAgent:
 
     def _get_client(self) -> OpenAI:
         if self._client is None:
-            if not self._api_key:
-                raise RuntimeError("VLM_API_KEY environment variable is not set")
-            self._client = OpenAI(base_url=self._api_url, api_key=self._api_key)
+            self._client = _get_vlm_client()
         return self._client
 
     def reset(self):
@@ -82,6 +132,14 @@ class VlmGuiAgent:
         raw = analyzer["raw"]
         action, params = self._postprocess_action(input_data, ui_state, action, params, app_name)
         action, params, skip_reason = self._normalize_schema(action, params)
+
+        # Stalled for too long: stop guessing, ask the user for help.
+        if (not skip_reason and action not in (ACTION_ASK, ACTION_COMPLETE)
+                and self._stuck_count >= ASK_ON_STUCK_STEPS):
+            action = ACTION_ASK
+            params = {"question": "任务似乎停滞了，需要你提供帮助：要不要返回上一页重试，还是换个方式？"}
+            skip_reason = ""
+
         if not skip_reason and action == ACTION_CLICK:
             point = params.get("point")
             if not self._click_point_matches_ui(point, ui_state):
@@ -135,7 +193,7 @@ class VlmGuiAgent:
         for attempt in range(3):
             try:
                 return client.chat.completions.create(
-                    model=self._model_id,
+                    model=os.environ.get("VLM_MODEL_ID", "doubao-seed-1-6-vision-250815"),
                     messages=messages,
                     extra_body={"thinking": {"type": "disabled"}},
                     **kwargs,
@@ -164,22 +222,29 @@ class VlmGuiAgent:
 
     def _run_planner(self, input_data: AgentInput) -> Tuple[List[str], str, str]:
         system_prompt = (
-            "你是一个任务规划器。根据用户任务，输出：\n"
+            "你是一个任务规划器。根据用户当前任务（结合会话上下文与长期记忆），输出：\n"
             "1. 抽象子目标序列\n"
             "2. 需要打开的应用名称\n\n"
             "规划要求：\n"
-            "- 子目标必须严格按照用户任务描述的语义顺序排列，不得跳步或倒序\n"
+            "- 子目标必须严格按照任务语义顺序排列，不得跳步或倒序\n"
             "- 子目标只描述阶段目标，不含按钮名称或坐标\n"
             "- 禁止同义重复或拆分重复：同一个目标不要拆成两个等价步骤\n"
-            "- 输入并选择候选属于同一阶段时，应合并为一个子目标（例如：搜索并选择地点）\n"
-            "- 对有先后依赖的任务，必须完成前一对象后再处理后一对象\n\n"
+            "- 输入并选择候选属于同一阶段时，应合并为一个子目标\n"
+            "- 用户指令中的指代（如\"刚才那个\"\"继续\"）要结合会话上下文消解后再规划\n"
+            "- 长期记忆中的用户偏好应直接体现在规划里（如记忆说常用高德则 app_name 用高德）\n\n"
             "只输出严格 JSON，格式：\n"
             "{\"app_name\":\"应用名\",\"subgoals\":[\"子目标1\",\"子目标2\"]}\n"
             "禁止输出任何额外文字。"
         )
+        context_text = _format_context(input_data.conversation_context)
+        memory_text = input_data.memory_text or "（无）"
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"任务：{input_data.instruction}"},
+            {"role": "user", "content": (
+                f"当前任务：{input_data.instruction}\n"
+                f"会话上下文：\n{context_text}\n"
+                f"长期记忆：\n{memory_text}"
+            )},
         ]
         try:
             resp = self._call_api(messages)
@@ -284,8 +349,7 @@ class VlmGuiAgent:
             recovery_hint = (
                 "\n【当前状态异常】\n"
                 f"- 已连续 {self._stuck_count} 步进度未变化，当前状态可能与预期不符\n"
-                "- 请优先尝试 BACK 返回上一页，或 HOME 回到桌面重新进入应用\n"
-                "- 若已在正确页面但操作无效，尝试 SCROLL 后重新寻找目标元素\n"
+                "- 可考虑输出 BACK/HOME 恢复，或输出 ASK 请用户指示\n"
             )
 
         history_text = ""
@@ -293,14 +357,33 @@ class VlmGuiAgent:
             recent = input_data.history_actions[-5:]
             history_text = f"\nrecent_actions: {json.dumps(recent, ensure_ascii=False)}"
 
+        ask_reply_text = ""
+        if input_data.ask_reply:
+            ask_reply_text = (
+                f"\n【用户对上次提问的回复】\n{input_data.ask_reply}\n"
+                "请优先按该回复执行，不要再问同样的问题。\n"
+            )
+
+        context_text = _format_context(input_data.conversation_context)
+        memory_text = input_data.memory_text or "（无）"
+
         system_prompt = (
-            "你是一个手机 GUI 自动化决策器，同时也是自身决策的风险评估器。\n\n"
-            "决策依据：\n"
-            "1. 以 instruction 为最终目标，判断任务是否完成\n"
-            "2. previous_progress 是上一轮状态摘要，必须作为当前决策的连续上下文优先参考\n"
-            "3. recent_actions 是最近几步的实际执行记录，用于判断当前状态是否符合预期\n"
-            "4. subgoals 是规划器对任务步骤的参考预测，仅供理解任务结构，不作为执行约束\n"
-            "5. 结合当前截图和 ui_elements 决定下一步操作\n\n"
+            "你是一个手机 GUI 自动化对话助手，同时也是自身决策的风险评估器。\n\n"
+            "决策依据（按优先级）：\n"
+            "1. ask_reply 非空时，优先按用户对上次提问的回复执行\n"
+            "2. instruction 为本轮最终目标，判断任务是否完成\n"
+            "3. conversation_context 是本会话此前的对话（含上轮总结与问答），用于消解指代（如\"继续\"\"刚才那个App\"）\n"
+            "4. memory_text 是长期记忆（用户偏好与历史路径），无冲突时应遵循\n"
+            "5. previous_progress 是上一轮状态摘要，必须作为连续上下文参考\n"
+            "6. recent_actions 是最近几步的实际执行记录\n"
+            "7. subgoals 是规划的参考预测，不作为执行约束\n"
+            "8. 结合当前截图和 ui_elements 决定下一步操作\n\n"
+            "【何时输出 ASK（向用户提问）】满足任一：\n"
+            "- instruction 存在指代或歧义，且 conversation_context/memory_text 无法消解\n"
+            "- 存在多个候选（如选哪个App、哪条路线），且用户偏好与记忆无法裁决\n"
+            "- 需要用户提供输入（验证码、账号选择、确认对象）才能继续\n"
+            "ASK 的 parameters: {\"question\":\"一句中文问题\",\"options\":[\"选项A\",\"选项B\"]}（options 可省略）\n"
+            "能够自主推进时禁止使用 ASK。\n\n"
             "【任务完成判断】\n"
             "- 当前页面出现敏感项（如立即呼叫、立即支付、立即付款）时直接输出 COMPLETE\n"
             "- previous_progress 已明确显示任务完成时直接输出 COMPLETE\n\n"
@@ -314,27 +397,20 @@ class VlmGuiAgent:
             "- progress 必须包含：已完成内容 + 当前页面状态 + 下一步目标\n\n"
             "【风险评估 —— 必须先评估再决定】\n"
             "- risk_level 取值：safe / medium / high\n"
-            "  · safe：浏览、滚动、返回、回到桌面、打开应用本体、输入搜索关键词、点击普通列表项\n"
-            "  · medium：仅限进入收费/实名/授权页面之前的可返回入口动作（例如点开\"立即付款\"弹窗外的入口按钮，但弹窗尚未出现）；此类动作仍可 BACK 撤销\n"
+            "  · safe：浏览、滚动、返回、回到桌面、打开应用本体、输入搜索关键词、点击普通列表项、ASK\n"
+            "  · medium：仅限进入收费/实名/授权页面之前的可返回入口动作；此类动作仍可 BACK 撤销\n"
             "  · high：不可逆或有外部影响的动作，包括：确认支付/转账、删除/清空数据、发送消息/拨号、提交不可撤销表单、授权第三方账号、卸载/清除应用数据\n"
             "- risk_category 取值：payment / delete / auth / submit / communication / system / none\n"
-            "  · payment：支付、确认支付、立即付款、立即购买、转账\n"
-            "  · delete：删除、清空、移除\n"
-            "  · auth：授权、登录、绑定第三方账号\n"
-            "  · submit：发布、提交订单等不可撤销的提交类\n"
-            "  · communication：发送消息、拨打电话、一键呼叫\n"
-            "  · system：卸载、格式化、清除应用数据、root\n"
-            "  · none：risk_level=safe 或 medium 且无明确类别时填 none\n"
-            "- current_state：一句话描述当前页面与上下文（让人类操作员能快速理解局势）\n"
+            "- current_state：一句话描述当前页面与上下文\n"
             "- consequence：执行该动作后会发生什么（包含金额、对象、影响范围等关键信息）\n"
             "- rollback_hint：如何撤销；若不可撤销，写\"不可撤销\"\n"
             "- risk_reason：为何判定为该 risk_level\n"
-            "- confidence：当前决策的置信度，0~1 之间的小数；含义=该动作能推进任务的把握程度\n"
+            "- confidence：当前决策的置信度，0~1\n"
             "- current_subgoal_index：当前正在执行的 subgoals 下标（0 起），若无法判断填 null\n"
             + recovery_hint
             + "\n输出严格 JSON：\n"
             "{\n"
-            "  \"action\":\"...\",\n"
+            "  \"action\":\"CLICK|SCROLL|TYPE|OPEN|BACK|HOME|COMPLETE|ASK\",\n"
             "  \"parameters\":{...},\n"
             "  \"progress\":\"...\",\n"
             "  \"risk_level\":\"safe|medium|high\",\n"
@@ -354,12 +430,15 @@ class VlmGuiAgent:
                 "type": "text",
                 "text": (
                     f"instruction: {input_data.instruction}\n"
+                    f"conversation_context:\n{context_text}\n"
+                    f"memory_text:\n{memory_text}\n"
                     f"subgoals: {json.dumps(self.subgoals, ensure_ascii=False)}\n"
                     f"page_type: {ui_state.get('page_type', 'unknown')}\n"
                     f"ui_elements: {json.dumps(ui_state.get('elements', []), ensure_ascii=False)}\n"
                     f"previous_progress: {self.progress or 'None'}\n"
                     f"current_step: {input_data.step_count}"
                     + history_text
+                    + ask_reply_text
                     + "\nReturn the best next action."
                 ),
             },
@@ -438,6 +517,38 @@ class VlmGuiAgent:
             }
 
     # ------------------------------------------------------------------
+    # Turn summary (chat reply)
+    # ------------------------------------------------------------------
+
+    def summarize_turn(self, input_data: AgentInput) -> str:
+        """One-shot summary of the finished turn. Degrades to a progress-based
+        fallback on any failure (no retry, keeps turn-end latency low)."""
+        actions = input_data.history_actions[-15:]
+        context_text = _format_context(input_data.conversation_context)
+        system_prompt = (
+            "你是手机 GUI 自动化助手。请用 1~3 句中文向用户总结本轮执行结果："
+            "完成了什么、当前处于什么状态、有什么需要用户注意的（如未完成的部分）。"
+            "直接输出总结文字，禁止 JSON 或额外说明。"
+        )
+        user_prompt = (
+            f"本轮指令：{input_data.instruction}\n"
+            f"会话上下文：\n{context_text}\n"
+            f"执行动作：{json.dumps(actions, ensure_ascii=False)}\n"
+            f"最终进度：{self.progress or '无'}"
+        )
+        try:
+            text = call_vlm(system_prompt, user_prompt)
+            if text and text.strip():
+                return text.strip()
+        except Exception as e:
+            logger.warning("summarize_turn failed (fallback used): %s", e)
+        done = len(actions)
+        base = f"本轮共执行了 {done} 步操作。"
+        if self.progress:
+            base += f"最终进度：{self.progress}"
+        return base
+
+    # ------------------------------------------------------------------
     # Post-processing and normalization
     # ------------------------------------------------------------------
 
@@ -451,6 +562,9 @@ class VlmGuiAgent:
     ) -> Tuple[str, Dict]:
         normalized = (action or "").upper().strip()
 
+        if normalized == ACTION_ASK:
+            return normalized, params if isinstance(params, dict) else {}
+
         if self._has_final_confirmation_element(ui_state):
             return ACTION_COMPLETE, {}
 
@@ -461,13 +575,24 @@ class VlmGuiAgent:
 
     def _normalize_schema(self, action: str, params: Dict) -> Tuple[str, Dict, str]:
         action = (action or "").upper().strip()
-        alias_map = {"OPEN_APP": ACTION_OPEN, "APP_OPEN": ACTION_OPEN}
+        alias_map = {"OPEN_APP": ACTION_OPEN, "APP_OPEN": ACTION_OPEN,
+                     "ASK_USER": ACTION_ASK, "QUESTION": ACTION_ASK}
         action = alias_map.get(action, action)
 
         valid = {ACTION_CLICK, ACTION_SCROLL, ACTION_TYPE, ACTION_OPEN,
-                 ACTION_COMPLETE, ACTION_BACK, ACTION_HOME}
+                 ACTION_COMPLETE, ACTION_BACK, ACTION_HOME, ACTION_ASK}
         if action not in valid:
             return ACTION_COMPLETE, {}, ""
+
+        if action == ACTION_ASK:
+            question = str(params.get("question", "") or "").strip()
+            if not question:
+                return ACTION_COMPLETE, {}, ""
+            clean: Dict[str, Any] = {"question": question}
+            options = params.get("options")
+            if isinstance(options, list):
+                clean["options"] = [str(o) for o in options if str(o).strip()]
+            return ACTION_ASK, clean, ""
 
         if action == ACTION_CLICK:
             point = params.get("point")
