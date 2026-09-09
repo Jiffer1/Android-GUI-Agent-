@@ -1,0 +1,20 @@
+# AndroidWorld smoke subset (feature 824): one task per app family.
+# Passed to run_benchmark.py via --smoke; one task name per line.
+AudioRecorderRecordAudio
+BrowserMultiply
+SimpleCalendarAddOneEvent
+CameraTakePhoto
+ClockStopWatchRunning
+ContactsAddContact
+ExpenseAddSingle
+FilesDeleteFile
+MarkorCreateNote
+OsmAndFavorite
+RecipeAddSingleRecipe
+RetroCreatePlaylist
+SimpleDrawProCreateDrawing
+SaveCopyOfReceiptTaskEval
+SimpleSmsSend
+SystemWifiTurnOn
+TurnOnWifiAndOpenApp
+VlcCreatePlaylist

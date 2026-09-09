@@ -212,16 +212,17 @@ ACTION_ASK = "ASK"        # 追加进 ALL_ACTIONS
     conversation_context: List[Dict] = field(default_factory=list)
     memory_text: str = ""
     ask_reply: str = ""
+    last_step_feedback: str = ""   # feature 908: 上一步回执(调用方计算,见 §4.6)
 ```
 
-ASK 参数 schema:`{"question": str, "options": List[str] (可选)}`。
+ASK 参数 schema:`{"question": str, "options": List[str] (可选), "reason_code": str (可选, feature 908)}`。
 删除 `ROUTE_*` 常量(路由体系移除)。
 
 ### 4.2 `app/agent/gui_agent.py` — MockGuiAgent 对话脚本
 
 | step_count | 输出 |
 |---|---|
-| 0 | `CLICK {"point":[500,500]}` |
+| 0 | `CLICK {"point":[500,500], "target":"中央按钮"}`(feature 908 起 target 必填) |
 | 1 | `ASK {"question": 非空, "options": [...]}` |
 | 2 | 非 ASK 的普通动作(收到 ask_reply 后继续) |
 | ≥3 | `COMPLETE {}` |
@@ -229,6 +230,119 @@ ASK 参数 schema:`{"question": str, "options": List[str] (可选)}`。
 - `summarize_turn(input_data) -> str`:返回非空固定文案
 - 保留 `reset()`、`last_ui_state`、`act(input) -> AgentOutput` 签名
 - ASK 步 risk_level 必须为默认 safe(不得触发风险等待)
+
+### 4.3 `app/agent/chat_agent.py` — 动作规范化与 skip 降级(feature 826)
+
+`_normalize_schema(action, params) -> (action, params, skip_reason)` 契约:
+
+| 输入 | 输出 |
+|---|---|
+| 合法集合外动作(如 `PAUSE`) | `(原动作名, {}, "invalid_action")` — 保留原名供诊断,绝不转 `COMPLETE`(feature 825 起 `WAIT` 已成为合法动作,见 §4.5) |
+| `ASK` 且 `question` 为空/缺失/空白 | `(ASK, {}, "missing_question")` — 与 `missing_point`/`missing_text` 风格一致 |
+| 合法动作 | 原样(或清洗参数)返回,`skip_reason=""` |
+
+skip 连击契约(`_apply_skip_streak`,实例计数 `_skip_streak`,常量
+`ASK_ON_SKIP_STREAK = 3`,命名对齐 `ASK_ON_STUCK_STEPS`):
+
+- 输出带 `skip_reason` → 连击 +1;产出可执行动作(`skip_reason=""`)→ 清零
+- 连击达 `ASK_ON_SKIP_STREAK` 次 → 转 `ASK`(固定求助问题 + `reason_code="degraded"`,文案风格同 stuck 保护)并清空 `skip_reason`(产品链路进 `waiting_ask`;benchmark 链路经 adapter 既有映射判 `infeasible`)
+- `reset()` 清零计数
+
+### 4.4 `benchmark/app_name_map.py` — OPEN 名解析(feature 826)
+
+`resolve_app_name(raw: str) -> str` 纯函数,查表顺序:**包名 →
+中文别名 → 原样透传**(strip 后精确匹配,包名匹配大小写不敏感)。
+
+- `PACKAGE_TO_APP_NAME`:AndroidWorld 自带 APK 的权威包名
+  (`com.arduia.expense`→`pro expense`、`com.flauschcode.broccoli`→`broccoli`、
+  `org.tasks`→`tasks`、`net.osmand`→`osmand`)
+- `CHINESE_ALIAS`:VLM 常见中文 app 名 → 官方英文显示名(value 为非空小写
+  ASCII,须能被 android_world `_PATTERN_TO_ACTIVITY` 前缀匹配;该匹配在
+  venv313 环境人工验证,产品 pytest 只做结构校验)
+
+### 4.5 `app/agent/chat_agent.py` — 单循环 ReAct 与结构化历史(feature 825)
+
+> **feature 908 起本节大部分被 §4.6 替代**:plan/elements/page_type/progress 输出、
+> 结构化历史窗口、CLICK-UI 对齐、首屏强制 OPEN 均已移除。仍然有效的部分:
+> 每步恰一次 VLM 调用、`_run_planner`/`_extract_ui`/`_analyze_action` 不得回归、
+> WAIT 动作语义、M-2 修复(engine)。
+
+
+**单循环**:每步恰好一次 VLM 调用,统一输出一个 JSON,同步产出
+`plan / thought / page_type / elements / action / parameters / progress /
+风险自评字段`。`_run_planner` / `_extract_ui` / `_analyze_action` 与独立
+`subgoals` 状态删除(AC-09)。
+
+- `plan`:step 0 必须输出 `{"app_name": str, "subgoals": [str]}`;后续步骤
+  可省略(=沿用)或输出修订版;解析失败/为空 → 降级 `[instruction]`,不阻塞
+- `thought`:缺失 → 空字符串,动作照常、`executable` 不受影响;仅随
+  `raw_output` 持久化,截断版进入结构化历史
+- 历史常量:`HISTORY_WINDOW_N = 8`(注入最近步数)、`HISTORY_ELEMENTS_K = 10`
+  (每步历史条目元素上限)、`HISTORY_THOUGHT_MAX_CHARS = 200`
+
+**结构化历史**(FR-07):agent 实例内部状态,turn 生命周期内自持;
+仅**实际执行**的步骤进入(ASK/COMPLETE/skip 步不进)。每步条目 =
+`page_type + elements[:K] + thought[:200] + action + parameters`;注入
+prompt 时带 `structured_history` 标记;多模态输入仅当前一张截图。
+
+**FR-04 高危强制确认**:CLICK 命中 `high_risk=true` 元素(±30)→ 代码强制
+`risk_level=high` 并将该元素补入 `ui_risk_elements`,无视模型自评。
+
+**WAIT 动作**(FR-09,`schemas.ACTION_WAIT` 加入 `ALL_ACTIONS`,动作空间 9 种):
+`_normalize_schema` 中无必填参数(`reason` 可选)、`executable=True`、默认
+safe;作为真实执行动作记入 `history_actions` 与结构化历史。engine 侧语义见
+`test_engine_ask_reask.py`。
+
+**M-2 修复**(engine):ASK 分支 `ask_event.wait()` 前 `clear()`,同轮第二次
+ASK 正常暂停等待。
+
+### 4.6 `app/agent/chat_agent.py` — 纯 ReAct 决策循环(feature 908)
+
+**每步输出仅**:`thought / action / parameters`(product 模式另含 risk 自评块)。
+删除字段:`plan`/`app_name`/`subgoals`/`current_subgoal_index`、`elements`、
+`page_type`、`progress` 及其相关常量(`HISTORY_*`)与首屏强制 OPEN override。
+
+- `thought`:自然语言观察+推理(页面观察、关键所见、简要计划、动作理由),
+  缺失 → 空字符串降级,`executable` 不受影响;全文随 `raw_output` 持久化
+- `CLICK` 的 `parameters` 必填 `target`(目标元素可见文本);缺失 →
+  `(CLICK, {}, "missing_target")` skip,与 `missing_point` 同风格
+- `ASK` 可带 `reason_code`:`no_target`/`missing_info`/`ambiguity`/`stuck`
+  (缺失 tolerated,照常执行);代码升级出的 ASK 固定携带:L2 卡住 =
+  `stuck`、skip 连击 = `degraded`(review m-2)
+- **VLM 不可用降级**(review M-1):`_call_api` 3 次重试耗尽 →
+  `(WAIT, {}, "vlm_unavailable")` 不可执行 skip,绝不静默 `COMPLETE`;
+  连续不可用经既有 skip 连击阶梯升级为 `ASK`
+
+**messages trace**(agent 实例内自持,turn 生命周期,append-only,全量不截断):
+
+```text
+[system(mode 组装), user(instruction [+product: 会话上下文/记忆]),
+ (assistant(thought+action), user(回执))*, user(当前: [ask_reply] [症状提示] + 当前截图)]
+```
+
+- 仅**实际执行**的动作(含 WAIT)进 trace;skip/ASK/COMPLETE 步不进
+- 多模态仅最后一条 user 携带当前一张截图;trace 全为纯文本
+- 调用方(engine/adapter)经 `AgentInput.last_step_feedback` 注入上一步回执
+  (非空时 agent append 为 user 条目);skip/ASK 步与无设备会话 feedback 为空串
+
+**三级卡住阶梯**(信号:`last_step_feedback` 含「无变化」+ 连续执行相同
+action+parameters 签名;常量 `STUCK_SOFT_STEPS = 2`、`ASK_ON_STUCK_STEPS = 3`):
+
+- 计数 < `STUCK_SOFT_STEPS`:正常步,prompt 不诱导 ASK
+- `STUCK_SOFT_STEPS` ≤ 计数 < `ASK_ON_STUCK_STEPS`(L1):当前 user 消息注入
+  症状提示(「你已连续 N 次 <action>,页面无变化,请分析原因:换一种动作
+  方式 / BACK 重置 / ASK」),不强制动作
+- 计数 ≥ `ASK_ON_STUCK_STEPS`(L2):强制 `ASK`(固定求助问题),计数清零
+- 页面恢复变化或签名变化 → 计数清零;`reset()` 清零
+
+**模式开关**:`ChatGuiAgent(mode="product" | "benchmark",
+disable_business_overrides=None)`;`disable_business_overrides=True` 为 deprecated
+别名映射到 `mode="benchmark"`。benchmark 模式:system prompt 不含 risk 块/
+会话上下文/记忆引用/首屏引导,ASK 语义为 infeasible 判定规则(无结果页立即判、
+前置信息缺失判、反复失败判、仅不确定禁止 ASK)。
+
+**engine 侧回执**(见 §5.3):动作执行后由决策图与稳定图比对生成确定性短句
+`上步 <action> <参数摘要> 后页面已变化/无变化`,skip 步为空串。
 
 ---
 
@@ -314,12 +428,20 @@ from app.memory.retriever import build_memory_context
 3. **每个 Turn 调 `agent_factory()` 一次新建 agent**(不跨 Turn 复用,防 subgoals 污染);
    `agent_factory=None` 时按 `USE_MOCK_AGENT` 选 MockGuiAgent/ChatGuiAgent
 4. 每步:截图(复用 stable_image / controller / placeholder)→
-   `AgentInput(..., conversation_context=…, memory_text=…, ask_reply=session.ask_reply)` →
-   `agent.act()`(executor 线程)
+   `AgentInput(..., conversation_context=…, memory_text=…, ask_reply=session.ask_reply,
+   last_step_feedback=…)` → `agent.act()`(executor 线程)。**回执(feature 908)**:
+   调用方仅在动作**实际执行**后生成回执——决策图与 `_wait_for_stable_screen`
+   返回图经 `_images_are_similar` 比对,组装 `上步 <action> <参数摘要> 后页面
+   已变化/无变化` 注入下一步 `last_step_feedback`;skip 步、ASK 步、无设备会话
+   与轮次首步为空串
 5. 输出 `ASK`:存 TurnStep + assistant Message(kind=ask,content=question)、
    Turn 置 `waiting_ask`、广播 `ask.requested`、`await ask_event.wait()`;
    恢复后**步进继续前进不回退**(下一 input 的 `step_count` 递增,`ask_reply` 注入)
-6. 风险:`assess_output` 保留;medium → `risk.observed`;high → Turn 置
+6. 风险(feature 908):`augment_risk_from_text(output)` 先行——CLICK 的
+   `target`/参数文本命中关键词表(支付/删除/发送/拨号/授权/提交类)→ 代码强制
+   `risk_level=high`(纯函数,命中返回**新**对象,入参不变,review m-3;
+   替代 825 的元素级命中,`ui_risk_elements` 链路移除);
+   随后 `assess_output`:medium → `risk.observed`;high → Turn 置
    `waiting_confirm`、广播 `risk.detected`、`await confirm_event.wait()`;
    `approved=False` → 轮次终止(status=`stopped`),**会话必须仍可开新 Turn**
 7. **每个 agent 输出各存一条 TurnStep(含 COMPLETE、含 ASK)**——旧引擎风格
@@ -433,6 +555,33 @@ def get_store() -> MemoryStore   # 模块级函数;测试 monkeypatch 此名字�
 | tasks_api_gone(AC-09) | 旧接口 404 |
 | init_db_drops_legacy_tables | §2.2 |
 | memory api ×3(AC-06) | §6.3 |
+
+### test_chat_agent_react_loop.py(feature 908 重写,AC-01/02/04/05/06)
+
+| 用例 | 验证 |
+|---|---|
+| TestSingleCallLoop ×2 | §4.6 单循环:每步 1 次调用;三阶段方法不得回归 |
+| TestSlimSchema ×4 | §4.6 输出仅 thought/action/parameters(+product risk 块);thought 缺失降级;raw 无 plan/elements |
+| TestMessagesTrace ×6 | §4.6 trace 全量注入不截断、append-only 前缀稳定、单图、回执入 trace、skip 步不入 trace |
+| TestClickTarget ×2 | §4.6 CLICK 缺 target → missing_target skip;带 target 正常执行 |
+| TestModeSwitch ×3 | §4.6 benchmark prompt 无 risk/记忆/上下文;product 含 risk 块;deprecated 参数映射 |
+| TestStuckLadder ×3 | §4.6 三级卡住:L1 症状注入不强制、L2 强制 ASK、恢复清零 |
+| TestWaitAction ×3 | §4.5(仍有效)WAIT 合法、reason 透传、入 trace |
+| TestDegradation ×4 | §4.3/§4.6 非法 JSON/非法动作降级 skip、VLM 不可用 → vlm_unavailable skip(均不静默 COMPLETE)、skip 连击 ASK 带 `degraded` |
+| TestAskReasonCode ×2 | §4.6 reason_code 透传与缺失 tolerated |
+
+### test_engine_feedback.py(feature 908,AC-03)
+
+| 用例 | 验证 |
+|---|---|
+| TestStepFeedback ×4 | §5.3-4 回执:首步空串、页面已变化/无变化注入下一步、skip 步空串 |
+
+### test_engine_ask_reask.py(feature 825,M-2 + WAIT)
+
+| 用例 | 验证 |
+|---|---|
+| TestSecondAskWaits ×2 | §4.5 M-2:二次 ASK 暂停等回复、等待中 stop 立即退出(AC-06 后半) |
+| TestEngineWait | §4.5 WAIT:稳定等待以 WAIT 为 key、等待期零 VLM、无设备操作(AC-13 engine 侧) |
 
 ---
 

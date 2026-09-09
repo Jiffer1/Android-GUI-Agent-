@@ -8,7 +8,7 @@ class MockGuiAgent:
     """Scripted mock agent for testing the conversation pipeline without a VLM.
 
     Script (by step_count, README §4.2):
-    - 0: CLICK center
+    - 0: CLICK center (with `target`, feature 908)
     - 1: ASK (with question + options)
     - 2: a regular action after the ask reply
     - >=3: COMPLETE
@@ -26,7 +26,7 @@ class MockGuiAgent:
         if step == 0:
             return AgentOutput(
                 action=ACTION_CLICK,
-                parameters={"point": [500, 500]},
+                parameters={"point": [500, 500], "target": "中央按钮"},
                 raw_output="mock: observe center",
             )
         elif step == 1:

@@ -44,10 +44,11 @@ from app.runtime.events import (
     RISK_DETECTED, RISK_OBSERVED, MEMORY_UPDATED,
 )
 from app.runtime.session import ConversationSession
-from app.safety.policy import assess_output
+from app.safety.policy import assess_output, augment_risk_from_text
 from app.storage.artifact_store import save_screenshot
 from app.storage.db import SessionLocal
 from app.storage.models import Conversation, Message, Turn, TurnStep
+from app.utils import images_are_similar
 from app.ws.connection_manager import manager
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,9 @@ USE_MOCK_AGENT = os.environ.get("USE_MOCK_AGENT", "").lower() in {"1", "true", "
 CONTEXT_MESSAGES = 6
 
 # Per-action max wait seconds for screen stabilization (unchanged from the
-# legacy engine; ASK performs no device action and never waits).
+# legacy engine; ASK performs no device action and never waits). WAIT carries
+# the longest budget: it is the explicit "let the page settle" action (FR-09)
+# and must cover app/page loading without another VLM call in between.
 _STABLE_MAX: Dict[str, float] = {
     "OPEN": 20.0,
     "CLICK": 10.0,
@@ -65,6 +68,7 @@ _STABLE_MAX: Dict[str, float] = {
     "TYPE": 3.0,
     "BACK": 8.0,
     "HOME": 8.0,
+    "WAIT": 20.0,
 }
 _STABLE_HARD_CAP: float = float(os.environ.get("WAIT_STABLE_MAX_SECONDS", "25"))
 _STABLE_CONSECUTIVE: int = 2
@@ -75,15 +79,6 @@ def _image_to_base64(image: Image.Image) -> str:
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-
-def _images_are_similar(img1: Image.Image, img2: Image.Image, threshold: float = 0.02) -> bool:
-    """Return True when two screenshots differ by less than threshold."""
-    size = (100, 100)
-    a = list(img1.resize(size).convert("L").getdata())
-    b = list(img2.resize(size).convert("L").getdata())
-    diff = sum(abs(p - q) for p, q in zip(a, b))
-    return diff / (255 * len(a)) < threshold
 
 
 def _make_placeholder_image() -> Image.Image:
@@ -274,7 +269,7 @@ class ConversationEngine:
 
     async def _wait_for_stable_screen(self, controller, loop, action: str) -> Image.Image:
         min_waits = {"OPEN": 2.5, "CLICK": 0.6, "SCROLL": 0.4, "TYPE": 0.15,
-                     "BACK": 0.6, "HOME": 0.8}
+                     "BACK": 0.6, "HOME": 0.8, "WAIT": 2.0}
         await asyncio.sleep(min_waits.get(action, 0.6))
 
         max_extra = min(_STABLE_MAX.get(action, 10.0), _STABLE_HARD_CAP)
@@ -289,10 +284,10 @@ class ConversationEngine:
             elapsed += poll
             curr = await loop.run_in_executor(None, controller.screenshot)
 
-            if _images_are_similar(prev, curr, threshold=_STABLE_EARLY_THRESHOLD):
+            if images_are_similar(prev, curr, threshold=_STABLE_EARLY_THRESHOLD):
                 consecutive_static += 1
                 consecutive_similar += 1
-            elif _images_are_similar(prev, curr):
+            elif images_are_similar(prev, curr):
                 consecutive_static = 0
                 consecutive_similar += 1
             else:
@@ -381,6 +376,9 @@ class ConversationEngine:
             agent.reset()
 
             history_actions = []
+            # feature 908: deterministic receipt of the last EXECUTED action
+            # ("上步 ... 后页面已变化/无变化"), injected into the next step.
+            last_step_feedback = ""
             stable_image: Optional[Image.Image] = None
             last_input: Optional[AgentInput] = None
             risk_cancelled = False
@@ -413,11 +411,22 @@ class ConversationEngine:
                     conversation_context=context,
                     memory_text=memory_text,
                     ask_reply=session.ask_reply,
+                    last_step_feedback=last_step_feedback,
                 )
                 last_input = agent_input
+                # The receipt is consumed by THIS step's decision; reset now
+                # and set it again below only if this step executes an action.
+                last_step_feedback = ""
+                # ask_reply is likewise consumed by THIS step's current-user
+                # message (review m-1): reset so later steps don't repeat the
+                # same reply forever. The ASK branch re-reads the (fresh)
+                # reply into the triggering input after waking, and the next
+                # loop iteration builds its input before this reset — both
+                # keep seeing the reply exactly once.
+                session.ask_reply = ""
                 output: AgentOutput = await loop.run_in_executor(None, agent.act, agent_input)
 
-                safety = assess_output(output)
+                safety = assess_output(augment_risk_from_text(output))
 
                 if output.action == ACTION_ASK:
                     question = output.parameters.get("question", "")
@@ -443,6 +452,10 @@ class ConversationEngine:
                         event=ASK_REQUESTED, conversation_id=conversation_id,
                         data={"turn_id": turn_id, "step_index": step_index,
                               "question": question, "options": options}))
+                    # Clear before waiting: the reply to a PREVIOUS ask in
+                    # this same turn left the event set, and without the
+                    # clear the second ask would fall straight through (M-2).
+                    session.ask_event.clear()
                     await session.ask_event.wait()
                     session.waiting_ask = False
                     # Write the reply back into the input that triggered the ASK:
@@ -489,8 +502,7 @@ class ConversationEngine:
                                   "current_state": safety.current_state,
                                   "consequence": safety.consequence,
                                   "rollback_hint": safety.rollback_hint,
-                                  "reason": safety.reason,
-                                  "ui_risk_elements": safety.ui_risk_elements}))
+                                  "reason": safety.reason}))
                         await session.confirm_event.wait()
                         session.waiting_confirm = False
                         if session.stop_requested or not session.confirm_approved:
@@ -510,6 +522,19 @@ class ConversationEngine:
                         if output.action != ACTION_COMPLETE:
                             stable_image = await self._wait_for_stable_screen(
                                 controller, loop, output.action)
+                        # feature 908: post-hoc receipt — decision screenshot
+                        # vs the stabilized screenshot (README §5.3-4).
+                        if stable_image is not None:
+                            changed = not images_are_similar(image, stable_image)
+                            param_summary = json.dumps(
+                                output.parameters, ensure_ascii=False)
+                            if len(param_summary) > 80:
+                                param_summary = param_summary[:80] + "…"
+                            last_step_feedback = (
+                                f"上一步 {output.action} {param_summary} 后页面"
+                                f"{'已变化' if changed else '无变化'}")
+                            logger.debug("step %d receipt: %s",
+                                         step_index, last_step_feedback)
                     except (AdbNotFoundError, DeviceError) as e:
                         logger.warning("Action execution failed: %s", e)
 
@@ -536,7 +561,6 @@ class ConversationEngine:
                           "consequence": safety.consequence,
                           "rollback_hint": safety.rollback_hint,
                           "confidence": output.confidence,
-                          "current_subgoal_index": output.current_subgoal_index,
                           "stuck_count": output.stuck_count,
                           "screenshot_base64": screenshot_b64,
                           "screenshot_path": screenshot_path}))

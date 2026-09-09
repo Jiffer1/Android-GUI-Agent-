@@ -1,0 +1,10 @@
+# Third-party android_world clone + its virtualenv (feature 824 benchmark)
+third_party/
+# Benchmark run artifacts (checkpoints, screenshots, per-step trajectories)
+android-gui-agent-platform/artifacts/benchmark/
+
+# Python bytecode
+__pycache__/
+
+# Local run artifacts (screenshots, per-step trajectories)
+artifacts/

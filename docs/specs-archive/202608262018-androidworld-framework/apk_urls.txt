@@ -1,0 +1,13 @@
+# android_world APK 手动下载清单（浏览器/下载工具下载后放入下面目录）
+# 目标目录: C:\Users\Jiffer\AppData\Local\Temp\android_world\app_data\
+https://storage.googleapis.com/gresearch/android_world/de.dennisguse.opentracks_5705.apk
+https://storage.googleapis.com/gresearch/android_world/net.osmand-4.6.13.apk
+https://storage.googleapis.com/gresearch/android_world/com.flauschcode.broccoli_1020600.apk
+https://storage.googleapis.com/gresearch/android_world/code.name.monkey.retromusic_10603.apk
+https://storage.googleapis.com/gresearch/android_world/com.simplemobiletools.calendar.pro_238.apk
+https://storage.googleapis.com/gresearch/android_world/com.simplemobiletools.draw.pro_79.apk
+https://storage.googleapis.com/gresearch/android_world/com.simplemobiletools.gallery.pro_396.apk
+https://storage.googleapis.com/gresearch/android_world/com.simplemobiletools.smsmessenger_85.apk
+https://storage.googleapis.com/gresearch/android_world/org.tasks_130605.apk
+https://storage.googleapis.com/gresearch/android_world/org.videolan.vlc_13050407.apk
+https://storage.googleapis.com/gresearch/android_world/org.videolan.vlc_13050408.apk
